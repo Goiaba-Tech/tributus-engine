@@ -23,9 +23,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = [
+dev = [
     "pytest",
     "pytest-cov",
+    "build",
+    "twine",
 ]
 
 [tool.setuptools.packages.find]
