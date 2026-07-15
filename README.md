@@ -2,7 +2,7 @@
 
 Pacote Python da biblioteca **Tributus Engine** para cálculo tributário brasileiro.
 
-**Versão:** 0.5.1  
+**Versão:** 0.5.2 
 **Requer:** Python ≥ 3.10, Pydantic ≥ 2.13.4  
 **Licença:** AGPL v3
 
@@ -77,13 +77,10 @@ payload = {
 result = engine.calculate_from_dict(payload)
 
 # Retorno simplificado (detailed=False)
-print(result.to_dict())
 # {'amounts': {'ipi': '108.00', 'icms': '184.96', 'pis': '9.54', 'cofins': '42.93'},
 #  'messages': [],
 #  'total': '345.43'}
 
-# Retorno completo (detailed=True)
-print(result.to_dict(detailed=True))
 ```
 
 ### 2) Estrutura de `taxes` suportada

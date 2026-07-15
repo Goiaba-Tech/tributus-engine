@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tributus-engine"
-version = "0.5.1"
+version = "0.5.2"
 description = "Tributus Engine - Brazilian Tax Engine and Calculator Library"
 readme = "README.md"
 authors = [
