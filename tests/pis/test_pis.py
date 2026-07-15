@@ -1,24 +1,7 @@
 from decimal import Decimal
-from tributus_engine.implementations.pis import (
-    BasePIS,
-    Pis01_02,
-    Pis03,
-)
 
-def test_base_pis():
-    valor_produto = Decimal('180.00')
-    valor_frete = Decimal('4.96')
-    valor_seguro = Decimal('0.50')
-    despesas_acessorias = Decimal('1.49')
-    valor_desconto = Decimal('9.92')
+from tributus_engine.models import Pis01_02, Pis03
 
-    base_pis = BasePIS(
-        valor_produto, valor_frete, valor_seguro,
-        despesas_acessorias, valor_desconto
-    )
-
-    v_bc = base_pis.calcular_base_pis()
-    assert v_bc == Decimal('177.03')
 
 def test_pis01_02():
     valor_produto = Decimal('180.00')
@@ -29,22 +12,25 @@ def test_pis01_02():
     aliquota_pis = Decimal('0.65')
 
     pis01_02 = Pis01_02(
-        valor_produto, valor_frete, valor_seguro,
-        despesas_acessorias, valor_desconto, aliquota_pis
+        valor_produto=valor_produto,
+        valor_frete=valor_frete,
+        valor_seguro=valor_seguro,
+        despesas_acessorias=despesas_acessorias,
+        valor_desconto=valor_desconto,
+        aliquota_pis=aliquota_pis,
     )
 
-    v_bc = pis01_02.base_pis()
-    v_pis = pis01_02.valor_pis()
+    assert pis01_02.base_pis == Decimal('177.03')
+    assert pis01_02.valor_pis == Decimal('1.15')
 
-    assert v_bc == Decimal('177.03')
-    assert v_pis == Decimal('1.15')
 
 def test_pis03():
-    quantidade_tributada = Decimal('15.00')
-    aliquota_unidade = Decimal('0.764')
+    base_calculo = Decimal('15.00')
+    aliquota_por_unidade = Decimal('0.764')
 
-    pis03 = Pis03(quantidade_tributada, aliquota_unidade)
+    pis03 = Pis03(
+        base_calculo=base_calculo,
+        aliquota_por_unidade=aliquota_por_unidade,
+    )
 
-    v_pis = pis03.valor_pis()
-
-    assert v_pis == Decimal('11.46')
+    assert pis03.valor_pis == Decimal('11.46')

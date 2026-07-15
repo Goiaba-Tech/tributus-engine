@@ -22,7 +22,7 @@ def _context_same_state() -> TaxContext:
             insurance_value=Decimal('10.00'),
             other_expenses=Decimal('20.00'),
         ),
-        taxes={'rates': {'icms': Decimal('18.00')}},
+        taxes={'icms': {'aliquota_icms_proprio': '18.00'}},
     )
 
 
@@ -46,14 +46,6 @@ def test_tax_engine_calculate_from_dict_payload():
     engine = TaxEngine()
 
     payload = {
-        'operation': {
-            'issuer_state': 'SP',
-            'recipient_state': 'RJ',
-            'operation_date': '2026-06-02',
-        },
-        'customer': {
-            'state': 'RJ',
-        },
         'values': {
             'quantity': '10',
             'unit_price': '100.00',
@@ -64,18 +56,15 @@ def test_tax_engine_calculate_from_dict_payload():
             'other_expenses': '20.00',
         },
         'taxes': {
-            'enabled': ['ipi', 'icms', 'fcp', 'pis', 'cofins', 'ibs', 'cbs'],
-            'rates': {
-                'fcp': '2.00',
-                'ibs': '16.00',
-                'cbs': '8.50',
-            },
             'ipi': {
                 'aliquota_ipi': '10.00',
             },
             'icms': {
                 'cst': '00',
                 'aliquota_icms_proprio': '18.00',
+            },
+            'fcp': {
+                'aliquota_fcp': '2.00',
             },
             'pis': {
                 'aliquota_pis': '1.65',
@@ -104,37 +93,10 @@ def test_tax_engine_calculate_from_dict_payload():
     assert result.amounts['cbs'] == Decimal('91.80')
     assert result.total == Decimal('662.74')
 
-
-def test_tax_engine_list_taxes_for_sale_all_states_from_dict():
-    engine = TaxEngine()
-
-    taxes_by_state = engine.list_taxes_for_sale_all_states_from_dict({
-        'product': {'ncm': '22030000', 'cest': '0300100'},
-        'taxes': {
-            'rates': {
-                'icms': '17.00',
-                'pis': '1.20',
-                'cofins': '5.40',
-            }
-        },
-    })
-
-    assert taxes_by_state['SP'] == {'icms': '17.00', 'pis': '1.20', 'cofins': '5.40'}
-    assert 'RJ' in taxes_by_state
-
-
 def test_tax_engine_calculate_icms_st_and_fcp_st_from_dict_payload():
     engine = TaxEngine()
 
     payload = {
-        'operation': {
-            'issuer_state': 'SP',
-            'recipient_state': 'RJ',
-            'operation_date': '2026-06-02',
-        },
-        'customer': {
-            'state': 'RJ',
-        },
         'values': {
             'quantity': '1',
             'unit_price': '135.00',
@@ -145,7 +107,6 @@ def test_tax_engine_calculate_icms_st_and_fcp_st_from_dict_payload():
             'other_expenses': '0.95',
         },
         'taxes': {
-            'enabled': ['icms', 'fcp', 'fcp_st'],
             'icms': {
                 'cst': '10',
                 'aliquota_icms_proprio': '12.00',
@@ -154,7 +115,7 @@ def test_tax_engine_calculate_icms_st_and_fcp_st_from_dict_payload():
                 'percentual_reducao_st': '10.00',
                 'include_ipi_in_base': False,
             },
-            'fcp': {
+            'fcp_st': {
                 'aliquota_fcp_st': '2.00',
             },
         },
@@ -166,3 +127,148 @@ def test_tax_engine_calculate_icms_st_and_fcp_st_from_dict_payload():
     assert result.amounts['icms'] == Decimal('16.83')
     assert result.amounts['icms_st'] == Decimal('15.12')
     assert result.amounts['fcp_st'] == Decimal('3.55')
+
+
+def test_payload_with_invalid_top_level_key():
+    engine = TaxEngine()
+
+    payload = {
+        'values': {
+            'quantity': '10',
+            'unit_price': '100.00',
+            'gross_value': '1000.00',
+        },
+        'taxes': {
+            'icms': {'aliquota_icms_proprio': '18.00'},
+        },
+        'campo_invalido': 'qualquer_coisa',
+    }
+
+    result = engine.calculate_from_dict(payload)
+
+    assert result.total == Decimal('0.00')
+    assert result.amounts == {}
+    assert any('campo_invalido' in msg for msg in result.messages)
+    assert any('chave inválida' in msg for msg in result.messages)
+
+
+def test_payload_with_invalid_values_key():
+    engine = TaxEngine()
+
+    payload = {
+        'values': {
+            'quantity': '10',
+            'unit_price': '100.00',
+            'gross_value': '1000.00',
+            'campo_invalido': 'xxx',
+        },
+        'taxes': {
+            'icms': {'aliquota_icms_proprio': '18.00'},
+        },
+    }
+
+    result = engine.calculate_from_dict(payload)
+
+    assert result.total == Decimal('0.00')
+    assert result.amounts == {}
+    assert any('campo_invalido' in msg for msg in result.messages)
+    assert any('values' in msg for msg in result.messages)
+
+
+def test_payload_with_invalid_tax_name():
+    engine = TaxEngine()
+
+    payload = {
+        'values': {
+            'quantity': '10',
+            'unit_price': '100.00',
+            'gross_value': '1000.00',
+        },
+        'taxes': {
+            'imposto_inexistente': {'aliquota': '18.00'},
+        },
+    }
+
+    result = engine.calculate_from_dict(payload)
+
+    assert result.total == Decimal('0.00')
+    assert result.amounts == {}
+    assert any('imposto_inexistente' in msg for msg in result.messages)
+    assert any('chave inválida' in msg for msg in result.messages)
+
+
+def test_payload_with_invalid_tax_param():
+    engine = TaxEngine()
+
+    payload = {
+        'values': {
+            'quantity': '10',
+            'unit_price': '100.00',
+            'gross_value': '1000.00',
+        },
+        'taxes': {
+            'icms': {
+                'aliquota_icms_proprio': '18.00',
+                'parametro_inexistente': 'yyy',
+            },
+        },
+    }
+
+    result = engine.calculate_from_dict(payload)
+
+    assert result.total == Decimal('0.00')
+    assert result.amounts == {}
+    assert any('parametro_inexistente' in msg for msg in result.messages)
+    assert any('taxes → icms' in msg or 'taxes.icms' in msg for msg in result.messages)
+
+
+def test_payload_with_multiple_invalid_keys():
+    engine = TaxEngine()
+
+    payload = {
+        'values': {
+            'quantity': '10',
+            'unit_price': '100.00',
+            'gross_value': '1000.00',
+            'bad_value': 'x',
+        },
+        'taxes': {
+            'icms': {'aliquota_icms_proprio': '18.00', 'bad_param': 'y'},
+            'pis': {'bad_pis': 'z'},
+        },
+        'extra_section': {},
+    }
+
+    result = engine.calculate_from_dict(payload)
+
+    assert result.total == Decimal('0.00')
+    assert result.amounts == {}
+    assert len(result.messages) >= 4
+
+
+def test_valid_payload_still_calculates():
+    """Test that valid payloads still work correctly after introducing Pydantic validation."""
+    engine = TaxEngine()
+
+    payload = {
+        'values': {
+            'quantity': '10',
+            'unit_price': '100.00',
+            'gross_value': '1000.00',
+            'discount_value': '100.00',
+            'freight_value': '50.00',
+            'insurance_value': '10.00',
+            'other_expenses': '20.00',
+        },
+        'taxes': {
+            'icms': {'cst': '00', 'aliquota_icms_proprio': '18.00'},
+        },
+    }
+
+    result = engine.calculate_from_dict(payload)
+
+    assert result.total > Decimal('0.00')
+    assert 'icms' in result.amounts
+    assert result.messages == []
+
+

@@ -4,9 +4,22 @@ from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_HALF_EVEN
 from typing import Any
 
-from .implementations.cofins import Cofins01_02, Cofins03
-from .implementations.ibs_cbs import Cbs, IbsUf
-from .implementations.icms.cst import (
+from pydantic import ValidationError
+
+from .models import (
+    ZERO,
+    Cofins01_02,
+    Cofins03,
+    Pis01_02,
+    Pis03,
+    IpiAdValorem,
+    IpiEspecifico,
+    Ibs,
+    Cbs,
+    Fcp,
+    FcpST,
+    FcpDiferido,
+    FcpEfetivo,
     Icms00,
     Icms10,
     Icms20,
@@ -19,17 +32,8 @@ from .implementations.icms.cst import (
     Icms202_203,
     Icms900,
 )
-from .implementations.icms.fcp import Fcp, FcpDiferido, FcpEfetivo, FcpST
-from .implementations.ipi import Ipi50AdValorem, Ipi50Especifico
-from .implementations.pis import Pis01_02, Pis03
+from .models import PayloadSchema
 
-BRAZIL_STATES = (
-    'AC', 'AL', 'AP', 'AM', 'BA', 'CE', 'DF', 'ES', 'GO', 'MA', 'MT', 'MS',
-    'MG', 'PA', 'PB', 'PR', 'PE', 'PI', 'RJ', 'RN', 'RS', 'RO', 'RR', 'SC',
-    'SP', 'SE', 'TO',
-)
-
-ZERO = Decimal('0.00')
 VALID_TAX_NAMES = {
     'icms',
     'icms_st',
@@ -43,7 +47,6 @@ VALID_TAX_NAMES = {
     'ibs',
     'cbs',
 }
-STATEFUL_TAX_NAMES = ('icms', 'fcp', 'pis', 'cofins', 'ibs', 'cbs')
 ORCHESTRATED_TAX_NAMES = {'ipi', 'icms', 'fcp', 'pis', 'cofins', 'ibs', 'cbs'}
 
 
@@ -92,40 +95,7 @@ class TaxContext:
             raise ValueError('values must be non-negative')
 
         if not isinstance(self.taxes, dict):
-            raise ValueError('taxes must be a dict with taxes and rates configuration')
-
-        rates = self.taxes.get('rates', {})
-        enabled = self.taxes.get('enabled', [])
-        if not isinstance(rates, dict):
-            raise ValueError('taxes.rates must be a dict')
-        if not isinstance(enabled, list):
-            raise ValueError('taxes.enabled must be a list')
-
-        invalid_enabled = set(enabled) - VALID_TAX_NAMES
-        if invalid_enabled:
-            raise ValueError(f'unknown tax names in taxes.enabled: {sorted(invalid_enabled)}')
-
-        invalid_rates = set(rates) - VALID_TAX_NAMES
-        if invalid_rates:
-            raise ValueError(f'unknown tax names in taxes.rates: {sorted(invalid_rates)}')
-
-        for tax_name, rate in rates.items():
-            if rate < ZERO:
-                raise ValueError(f'tax rate must be non-negative: {tax_name}')
-
-        if not enabled and not rates:
-            has_tax_detail = any(
-                name != 'rates' and isinstance(config, dict)
-                for name, config in self.taxes.items()
-            )
-            if not has_tax_detail:
-                raise ValueError('taxes must include enabled/rates or per-tax config entries')
-
-    def get_rate(self, tax_name: str) -> Decimal | None:
-        rates = self.taxes.get('rates', {})
-        if not isinstance(rates, dict):
-            return None
-        return rates.get(tax_name)
+            raise ValueError('taxes must be a dict')
 
     def get_tax_detail(self, tax_name: str) -> dict[str, Any]:
         config = self.taxes.get(tax_name, {})
@@ -162,13 +132,20 @@ class TaxResult:
     def total(self) -> Decimal:
         return _sum_amounts(list(self.amounts.values()))
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, detailed: bool = False) -> dict[str, Any]:
+        if not detailed:
+            return {
+                'amounts': {k: v for k, v in self.amounts.items()},
+                'messages': self.messages,
+                'total': self.total,
+            }
+
         taxes = {}
         for tax_name in self.amounts:
             taxes[tax_name] = {
-                'base': f'{self.bases[tax_name]:.2f}',
-                'rate': f'{self.rates[tax_name]:.2f}',
-                'amount': f'{self.amounts[tax_name]:.2f}',
+                'base': self.bases[tax_name],
+                'rate': self.rates[tax_name],
+                'amount': self.amounts[tax_name],
             }
             if tax_name in self.metadata:
                 taxes[tax_name]['metadata'] = self.metadata[tax_name]
@@ -176,7 +153,7 @@ class TaxResult:
             'taxes': taxes,
             'calculation_order': self.calculation_order,
             'messages': self.messages,
-            'total': f'{self.total:.2f}',
+            'total': self.total,
         }
 
 
@@ -251,7 +228,20 @@ class TaxDependencyGraph:
 
 
 class TaxEngine:
-    def calculate(self, context: TaxContext) -> TaxResult:
+    def calculate(self, context: TaxContext, detailed: bool = False) -> TaxResult:
+        """Executa o cálculo de todos os tributos habilitados para um dado contexto.
+
+        Valida o contexto, resolve a ordem de dependência entre os tributos
+        (ex: ICMS depende de IPI) e executa cada cálculo sequencialmente.
+
+        Args:
+            context: TaxContext com os valores da operação e configurações
+                     dos tributos a serem calculados.
+
+        Returns:
+            TaxResult contendo as bases, alíquotas, valores calculados,
+            ordem de cálculo, metadados e mensagens de erro/aviso.
+        """
         context.validate()
         result = TaxResult()
         order = self._resolve_order(context)
@@ -260,25 +250,32 @@ class TaxEngine:
         for tax_name in order:
             self._calculate_tax(tax_name, context, result)
 
-        return result
+        return result.to_dict(detailed)
 
-    def calculate_from_dict(self, payload: dict[str, Any]) -> TaxResult:
-        return self.calculate(self._context_from_dict(payload))
+    def calculate_from_dict(self, payload: dict[str, Any], detailed: bool = False) -> TaxResult:
+        """Valida e calcula tributos a partir de um payload em formato dicionário.
 
-    def list_taxes_for_sale_all_states_from_dict(self, payload: dict[str, Any]) -> dict[str, dict[str, str]]:
-        base_payload = dict(payload)
-        results: dict[str, dict[str, str]] = {}
-        for state in BRAZIL_STATES:
-            context = self._context_from_dict(base_payload)
+        O payload é validado contra o PayloadSchema (Pydantic) antes do cálculo.
+        Se a validação falhar, retorna um TaxResult com as mensagens de erro
+        formatadas em português.
 
-            state_rates: dict[str, str] = {}
-            for tax_name in STATEFUL_TAX_NAMES:
-                rate = self._resolve_rate(tax_name, context)
-                if rate > ZERO:
-                    state_rates[tax_name] = f'{rate:.2f}'
-            results[state] = state_rates
+        Args:
+            payload: Dicionário no formato esperado pelo PayloadSchema,
+                     contendo as chaves 'values' e 'taxes'.
 
-        return results
+        Returns:
+            TaxResult com os resultados do cálculo ou mensagens de erro
+            de validação.
+        """
+        try:
+            PayloadSchema.model_validate(payload)
+        except ValidationError as exc:
+            result = TaxResult()
+            result.messages = [
+                self._format_pydantic_error(error) for error in exc.errors()
+            ]
+            return result
+        return self.calculate(self._context_from_dict(payload), detailed)
 
     def _resolve_order(self, context: TaxContext) -> list[str]:
         graph = TaxDependencyGraph()
@@ -332,21 +329,27 @@ class TaxEngine:
         mode = self._mode(config, specific_key='aliquota_por_unidade')
 
         if mode == 'specific':
+            rate = _to_decimal(config.get('aliquota_por_unidade'))
+            if rate == ZERO:
+                result.messages.append("IPI: 'aliquota_por_unidade' não configurada em taxes.ipi")
+                return
             base = _to_decimal(config.get('base_calculo'), values.quantity)
-            rate = _to_decimal(config.get('aliquota_por_unidade'), self._resolve_rate('ipi', context))
-            calculator = Ipi50Especifico(base_calculo=base, aliquota_por_unidade=rate)
-            amount = calculator.valor_ipi()
+            calculator = IpiEspecifico(base_calculo=base, aliquota_por_unidade=rate)
+            amount = calculator.valor_ipi  # propriedade, não método
         else:
-            rate = _to_decimal(config.get('aliquota_ipi'), self._resolve_rate('ipi', context))
-            calculator = Ipi50AdValorem(
+            rate = _to_decimal(config.get('aliquota_ipi'))
+            if rate == ZERO:
+                result.messages.append("IPI: 'aliquota_ipi' não configurada em taxes.ipi")
+                return
+            calculator = IpiAdValorem(
                 valor_produto=values.gross_value,
                 valor_frete=values.freight_value,
                 valor_seguro=values.insurance_value,
                 despesas_acessorias=values.other_expenses,
                 aliquota_ipi=rate,
             )
-            base = calculator.calcular_base_ipi()
-            amount = calculator.valor_ipi()
+            base = calculator.base_ipi
+            amount = calculator.valor_ipi
 
         result.register_tax('ipi', base=base, rate=rate, amount=amount, metadata={'mode': mode})
 
@@ -355,8 +358,9 @@ class TaxEngine:
         config = self._tax_details(context, 'icms')
         cst = str(config.get('cst', '00')).strip().upper().replace('-', '_')
         valor_ipi = result.amounts.get('ipi', ZERO) if config.get('include_ipi_in_base', True) else ZERO
-        own_rate = _to_decimal(config.get('aliquota_icms_proprio'), self._resolve_rate('icms', context))
-        st_rate = _to_decimal(config.get('aliquota_icms_st'), self._resolve_rate('icms_st', context))
+
+        own_rate = _to_decimal(config.get('aliquota_icms_proprio'))
+        st_rate = _to_decimal(config.get('aliquota_icms_st'))
         mva = _to_decimal(config.get('mva'))
         reducao = _to_decimal(config.get('percentual_reducao'))
         reducao_st = _to_decimal(config.get('percentual_reducao_st'))
@@ -372,103 +376,145 @@ class TaxEngine:
         }
 
         if cst == '00':
+            if own_rate == ZERO:
+                result.messages.append("ICMS: 'aliquota_icms_proprio' não configurada em taxes.icms")
+                return
             calculator = Icms00(valor_ipi=valor_ipi, aliquota_icms_proprio=own_rate, **common)
-            result.register_tax('icms', base=calculator.base_icms_proprio(), rate=own_rate, amount=calculator.valor_icms_proprio(), metadata={'type': 'Icms00'})
+            result.register_tax('icms', base=calculator.base_icms_proprio, rate=own_rate, amount=calculator.valor_icms_proprio, metadata={'type': 'Icms00'})
             return
 
         if cst == '10':
+            if own_rate == ZERO or st_rate == ZERO:
+                result.messages.append("ICMS CST 10: 'aliquota_icms_proprio' e 'aliquota_icms_st' são obrigatórias")
+                return
             calculator = Icms10(valor_ipi=valor_ipi, aliquota_icms_proprio=own_rate, aliquota_icms_st=st_rate, mva=mva, percentual_reducao_st=reducao_st, **common)
-            result.register_tax('icms', base=calculator.base_icms_proprio(), rate=own_rate, amount=calculator.valor_icms_proprio(), metadata={'type': 'Icms10'})
-            result.register_tax('icms_st', base=calculator.base_icms_st(), rate=st_rate, amount=calculator.valor_icms_st(), metadata={'type': 'Icms10'})
+            result.register_tax('icms', base=calculator.base_icms_proprio, rate=own_rate, amount=calculator.valor_icms_proprio, metadata={'type': 'Icms10'})
+            result.register_tax('icms_st', base=calculator.base_icms_st, rate=st_rate, amount=calculator.valor_icms_st, metadata={'type': 'Icms10'})
             return
 
         if cst == '20':
+            if own_rate == ZERO:
+                result.messages.append("ICMS CST 20: 'aliquota_icms_proprio' não configurada em taxes.icms")
+                return
             calculator = Icms20(valor_ipi=valor_ipi, aliquota_icms_proprio=own_rate, percentual_reducao=reducao, **common)
-            result.register_tax('icms', base=calculator.base_reduzida_icms_proprio(), rate=own_rate, amount=calculator.valor_icms_proprio(), metadata={'type': 'Icms20'})
+            result.register_tax('icms', base=calculator.base_reduzida_icms_proprio, rate=own_rate, amount=calculator.valor_icms_proprio, metadata={'type': 'Icms20'})
             return
 
         if cst == '30':
+            if own_rate == ZERO:
+                result.messages.append("ICMS CST 30: 'aliquota_icms_proprio' não configurada em taxes.icms")
+                return
             calculator = Icms30(valor_ipi=valor_ipi, aliq_icms_proprio=own_rate, aliq_icms_st=st_rate, mva=mva, percentual_reducao_st=reducao_st, **common)
-            result.register_tax('icms', base=calculator.base_icms_proprio(), rate=own_rate, amount=calculator.valor_icms_desonerado(), metadata={'type': 'Icms30', 'note': 'desonerado'})
-            result.register_tax('icms_st', base=calculator.base_icms_st(), rate=st_rate, amount=calculator.valor_icms_st(), metadata={'type': 'Icms30'})
+            result.register_tax('icms', base=calculator.base_icms_proprio, rate=own_rate, amount=calculator.valor_icms_desonerado, metadata={'type': 'Icms30', 'note': 'desonerado'})
+            result.register_tax('icms_st', base=calculator.base_icms_st, rate=st_rate, amount=calculator.valor_icms_st, metadata={'type': 'Icms30'})
             return
 
         if cst == '51':
+            if own_rate == ZERO:
+                result.messages.append("ICMS CST 51: 'aliquota_icms_proprio' não configurada em taxes.icms")
+                return
             calculator = Icms51(valor_ipi=valor_ipi, aliq_icms_proprio=own_rate, percentual_reducao=reducao, percentual_diferimento=diferimento, **common)
-            result.register_tax('icms', base=calculator.base_icms_proprio(), rate=own_rate, amount=calculator.valor_icms_proprio(), metadata={'type': 'Icms51'})
+            result.register_tax('icms', base=calculator.base_icms_proprio, rate=own_rate, amount=calculator.valor_icms_proprio, metadata={'type': 'Icms51'})
             return
 
         if cst == '70':
+            if own_rate == ZERO:
+                result.messages.append("ICMS CST 70: 'aliquota_icms_proprio' não configurada em taxes.icms")
+                return
             calculator = Icms70(valor_ipi=valor_ipi, aliquota_icms_proprio=own_rate, aliquota_icms_st=st_rate, mva=mva, percentual_reducao=reducao, percentual_reducao_st=reducao_st, **common)
-            result.register_tax('icms', base=calculator.base_icms_proprio(), rate=own_rate, amount=calculator.valor_icms_proprio(), metadata={'type': 'Icms70'})
-            result.register_tax('icms_st', base=calculator.base_icms_st(), rate=st_rate, amount=calculator.valor_icms_st(), metadata={'type': 'Icms70'})
+            result.register_tax('icms', base=calculator.base_icms_proprio, rate=own_rate, amount=calculator.valor_icms_proprio, metadata={'type': 'Icms70'})
+            result.register_tax('icms_st', base=calculator.base_icms_st, rate=st_rate, amount=calculator.valor_icms_st, metadata={'type': 'Icms70'})
             return
 
         if cst == '90':
+            if own_rate == ZERO:
+                result.messages.append("ICMS CST 90: 'aliquota_icms_proprio' não configurada em taxes.icms")
+                return
             calculator = Icms90(valor_ipi=valor_ipi, aliquota_icms_proprio=own_rate, aliquota_icms_st=st_rate, mva=mva, percentual_reducao=reducao, percentual_reducao_st=reducao_st, **common)
-            base_icms = calculator.calcular_base_reduzida_icms_proprio() if reducao > ZERO else calculator.calcular_base_icms_proprio()
-            amount_icms = calculator.valor_icms_proprio_base_reduzida() if reducao > ZERO else calculator.valor_icms_proprio()
-            base_st = calculator.calcular_base_reduzida_icms_st() if reducao_st > ZERO else calculator.calcular_base_icms_st()
-            amount_st = calculator.valor_icms_st_base_reduzida() if reducao_st > ZERO else calculator.valor_icms_st()
+            base_icms = calculator.base_reduzida_icms_proprio if reducao > ZERO else calculator.base_icms_proprio
+            amount_icms = calculator.valor_icms_proprio_base_reduzida if reducao > ZERO else calculator.valor_icms_proprio
+            base_st = calculator.base_reduzida_icms_st if reducao_st > ZERO else calculator.base_icms_st
+            amount_st = calculator.valor_icms_st_base_reduzida if reducao_st > ZERO else calculator.valor_icms_st
             result.register_tax('icms', base=base_icms, rate=own_rate, amount=amount_icms, metadata={'type': 'Icms90'})
             result.register_tax('icms_st', base=base_st, rate=st_rate, amount=amount_st, metadata={'type': 'Icms90'})
             return
 
         if cst == '101':
             calculator = Icms101(percentual_credito_sn=credito_sn, percentual_reducao=reducao, **common)
-            result.register_tax('icms_credito_sn', base=calculator.calcular_base_icms_proprio(), rate=credito_sn, amount=calculator.valor_credito_sn(), metadata={'type': 'Icms101'})
+            result.register_tax('icms_credito_sn', base=calculator.base_icms_proprio, rate=credito_sn, amount=calculator.valor_credito_sn, metadata={'type': 'Icms101'})
             return
 
         if cst == '201':
+            if own_rate == ZERO:
+                result.messages.append("ICMS CST 201: 'aliquota_icms_proprio' não configurada em taxes.icms")
+                return
             calculator = Icms201(aliquota_icms_proprio=own_rate, aliquota_icms_st=st_rate, mva=mva, percentual_credito_sn=credito_sn, percentual_reducao=reducao, percentual_reducao_st=reducao_st, **common)
-            result.register_tax('icms', base=calculator.calcular_base_icms_proprio(), rate=own_rate, amount=calculator.valor_icms_proprio(), metadata={'type': 'Icms201'})
-            result.register_tax('icms_st', base=calculator.base_icms_st(), rate=st_rate, amount=calculator.valor_icms_st(), metadata={'type': 'Icms201'})
-            result.register_tax('icms_credito_sn', base=calculator.calcular_base_icms_proprio(), rate=credito_sn, amount=calculator.valor_credito_sn(), metadata={'type': 'Icms201'})
+            result.register_tax('icms', base=calculator.base_icms_proprio, rate=own_rate, amount=calculator.valor_icms_proprio, metadata={'type': 'Icms201'})
+            result.register_tax('icms_st', base=calculator.base_icms_st, rate=st_rate, amount=calculator.valor_icms_st, metadata={'type': 'Icms201'})
+            result.register_tax('icms_credito_sn', base=calculator.base_icms_proprio, rate=credito_sn, amount=calculator.valor_credito_sn, metadata={'type': 'Icms201'})
             return
 
         if cst in {'202', '203', '202_203'}:
+            if own_rate == ZERO:
+                result.messages.append(f"ICMS CST {cst}: 'aliquota_icms_proprio' não configurada em taxes.icms")
+                return
             calculator = Icms202_203(aliquota_icms_proprio=own_rate, aliquota_icms_st=st_rate, mva=mva, percentual_reducao=reducao, percentual_reducao_st=reducao_st, **common)
-            result.register_tax('icms', base=calculator.calcular_base_icms_proprio(), rate=own_rate, amount=calculator.valor_icms_proprio(), metadata={'type': 'Icms202_203'})
-            result.register_tax('icms_st', base=calculator.base_icms_st(), rate=st_rate, amount=calculator.valor_icms_st(), metadata={'type': 'Icms202_203'})
+            result.register_tax('icms', base=calculator.base_icms_proprio, rate=own_rate, amount=calculator.valor_icms_proprio, metadata={'type': 'Icms202_203'})
+            result.register_tax('icms_st', base=calculator.base_icms_st, rate=st_rate, amount=calculator.valor_icms_st, metadata={'type': 'Icms202_203'})
             return
 
         if cst == '900':
+            if own_rate == ZERO:
+                result.messages.append("ICMS CST 900: 'aliquota_icms_proprio' não configurada em taxes.icms")
+                return
             calculator = Icms900(valor_ipi=valor_ipi, aliquota_icms_proprio=own_rate, aliquota_icms_st=st_rate, mva=mva, percentual_credito_sn=credito_sn, percentual_reducao=reducao, percentual_reducao_st=reducao_st, **common)
-            base_icms = calculator.calcular_base_reduzida_icms_proprio() if reducao > ZERO else calculator.calcular_base_icms_proprio()
-            amount_icms = calculator.valor_icms_proprio_base_reduzida() if reducao > ZERO else calculator.valor_icms_proprio()
-            base_st = calculator.calcular_base_reduzida_icms_st() if reducao_st > ZERO else calculator.calcular_base_icms_st()
-            amount_st = calculator.valor_icms_st_base_reduzida() if reducao_st > ZERO else calculator.valor_icms_st()
+            base_icms = calculator.base_reduzida_icms_proprio if reducao > ZERO else calculator.base_icms_proprio
+            amount_icms = calculator.valor_icms_proprio_base_reduzida if reducao > ZERO else calculator.valor_icms_proprio
+            base_st = calculator.base_reduzida_icms_st if reducao_st > ZERO else calculator.base_icms_st
+            amount_st = calculator.valor_icms_st_base_reduzida if reducao_st > ZERO else calculator.valor_icms_st
             result.register_tax('icms', base=base_icms, rate=own_rate, amount=amount_icms, metadata={'type': 'Icms900'})
             result.register_tax('icms_st', base=base_st, rate=st_rate, amount=amount_st, metadata={'type': 'Icms900'})
             if credito_sn > ZERO:
                 credit_base = base_icms
-                result.register_tax('icms_credito_sn', base=credit_base, rate=credito_sn, amount=calculator.valor_credito_sn(), metadata={'type': 'Icms900'})
+                result.register_tax('icms_credito_sn', base=credit_base, rate=credito_sn, amount=calculator.valor_credito_sn, metadata={'type': 'Icms900'})
             return
 
-        raise ValueError(f'unsupported ICMS cst: {cst}')
+        result.messages.append(f"ICMS: CST '{cst}' não suportado")
+        return
 
     def _calculate_fcp(self, context: TaxContext, result: TaxResult) -> None:
         config = self._tax_details(context, 'fcp')
+        fcp_st_config = self._tax_details(context, 'fcp_st')
         deferment_rate = _to_decimal(config.get('aliquota_diferimento_fcp'))
 
-        if 'icms_st' in result.bases and (config.get('use_st_base') or self._is_enabled(context, 'fcp_st')):
+        fcp_st_rate = _to_decimal(fcp_st_config.get('aliquota_fcp_st') or config.get('aliquota_fcp_st'))
+        if 'icms_st' in result.bases and (
+            config.get('use_st_base')
+            or 'fcp_st' in self._raw_enabled_taxes(context)
+            or fcp_st_rate > ZERO
+        ):
+            if fcp_st_rate == ZERO:
+                result.messages.append("FCP ST: 'aliquota_fcp_st' não configurada em taxes.fcp ou taxes.fcp_st")
+                return
             base = result.bases['icms_st']
-            rate = _to_decimal(config.get('aliquota_fcp_st'), self._resolve_rate('fcp_st', context))
-            calculator = FcpST(base_calculo_st=base, aliquota_fcp_st=rate)
-            amount = calculator.valor_fcp_st()
-            result.register_tax('fcp_st', base=base, rate=rate, amount=amount, metadata={'type': 'FcpST'})
+            calculator = FcpST(base_calculo_st=base, aliquota_fcp_st=fcp_st_rate)
+            amount = calculator.valor_fcp_st
+            result.register_tax('fcp_st', base=base, rate=fcp_st_rate, amount=amount, metadata={'type': 'FcpST'})
             return
 
         base = result.bases.get('icms', BaseCalculator.from_context(context).base_padrao())
-        rate = _to_decimal(config.get('aliquota_fcp'), self._resolve_rate('fcp', context))
+        rate = _to_decimal(config.get('aliquota_fcp'))
+        if rate == ZERO:
+            result.messages.append("FCP: 'aliquota_fcp' não configurada em taxes.fcp")
+            return
         calculator = Fcp(base_calculo=base, aliquota_fcp=rate)
-        amount = calculator.valor_fcp()
+        amount = calculator.valor_fcp
 
         if deferment_rate > ZERO:
             deferred = FcpDiferido(valor_fcp=amount, aliquota_diferimento_fcp=deferment_rate)
-            effective = FcpEfetivo(valor_fcp=amount, valor_fcp_diferido=deferred.valor_fcp_diferido())
-            result.register_tax('fcp_diferido', base=base, rate=deferment_rate, amount=deferred.valor_fcp_diferido(), metadata={'type': 'FcpDiferido'})
-            amount = effective.valor_fcp_efetivo()
+            effective = FcpEfetivo(valor_fcp=amount, valor_fcp_diferido=deferred.valor_fcp_diferido)
+            result.register_tax('fcp_diferido', base=base, rate=deferment_rate, amount=deferred.valor_fcp_diferido, metadata={'type': 'FcpDiferido'})
+            amount = effective.valor_fcp_efetivo
 
         result.register_tax('fcp', base=base, rate=rate, amount=amount, metadata={'type': 'Fcp'})
 
@@ -478,12 +524,18 @@ class TaxEngine:
         mode = self._mode(config, specific_key='aliquota_por_unidade')
 
         if mode == 'specific':
+            rate = _to_decimal(config.get('aliquota_por_unidade'))
+            if rate == ZERO:
+                result.messages.append("PIS: 'aliquota_por_unidade' não configurada em taxes.pis")
+                return
             base = _to_decimal(config.get('base_calculo'), values.quantity)
-            rate = _to_decimal(config.get('aliquota_por_unidade'), self._resolve_rate('pis', context))
             calculator = Pis03(base_calculo=base, aliquota_por_unidade=rate)
-            amount = calculator.valor_pis()
+            amount = calculator.valor_pis
         else:
-            rate = _to_decimal(config.get('aliquota_pis'), self._resolve_rate('pis', context))
+            rate = _to_decimal(config.get('aliquota_pis'))
+            if rate == ZERO:
+                result.messages.append("PIS: 'aliquota_pis' não configurada em taxes.pis")
+                return
             calculator = Pis01_02(
                 valor_produto=values.gross_value,
                 valor_frete=values.freight_value,
@@ -493,8 +545,8 @@ class TaxEngine:
                 aliquota_pis=rate,
                 valor_icms=result.amounts.get('icms', ZERO),
             )
-            base = calculator.base_pis()
-            amount = calculator.valor_pis()
+            base = calculator.base_pis
+            amount = calculator.valor_pis
 
         result.register_tax('pis', base=base, rate=rate, amount=amount, metadata={'mode': mode})
 
@@ -504,12 +556,18 @@ class TaxEngine:
         mode = self._mode(config, specific_key='aliquota_por_unidade')
 
         if mode == 'specific':
+            rate = _to_decimal(config.get('aliquota_por_unidade'))
+            if rate == ZERO:
+                result.messages.append("COFINS: 'aliquota_por_unidade' não configurada em taxes.cofins")
+                return
             base = _to_decimal(config.get('base_calculo'), values.quantity)
-            rate = _to_decimal(config.get('aliquota_por_unidade'), self._resolve_rate('cofins', context))
             calculator = Cofins03(base_calculo=base, aliquota_por_unidade=rate)
-            amount = calculator.valor_cofins()
+            amount = calculator.valor_cofins
         else:
-            rate = _to_decimal(config.get('aliquota_cofins'), self._resolve_rate('cofins', context))
+            rate = _to_decimal(config.get('aliquota_cofins'))
+            if rate == ZERO:
+                result.messages.append("COFINS: 'aliquota_cofins' não configurada em taxes.cofins")
+                return
             calculator = Cofins01_02(
                 valor_produto=values.gross_value,
                 valor_frete=values.freight_value,
@@ -519,17 +577,20 @@ class TaxEngine:
                 aliquota_cofins=rate,
                 valor_icms=result.amounts.get('icms', ZERO),
             )
-            base = calculator.base_cofins()
-            amount = calculator.valor_cofins()
+            base = calculator.base_cofins
+            amount = calculator.valor_cofins
 
         result.register_tax('cofins', base=base, rate=rate, amount=amount, metadata={'mode': mode})
 
     def _calculate_ibs(self, context: TaxContext, result: TaxResult) -> None:
         values = context.values
         config = self._tax_details(context, 'ibs')
-        rate = _to_decimal(config.get('aliquota_efetiva_percentual'), self._resolve_rate('ibs', context))
+        rate = _to_decimal(config.get('aliquota_efetiva_percentual'))
+        if rate == ZERO:
+            result.messages.append("IBS: 'aliquota_efetiva_percentual' não configurada em taxes.ibs")
+            return
         deferment = _to_decimal(config.get('percentual_diferimento'))
-        calculator = IbsUf(
+        calculator = Ibs(
             valor_produto=values.gross_value,
             valor_frete=values.freight_value,
             valor_seguro=values.insurance_value,
@@ -537,12 +598,15 @@ class TaxEngine:
             aliquota_efetiva_percentual=rate,
             percentual_diferimento=deferment,
         )
-        result.register_tax('ibs', base=calculator.valor_base_ibs_cbs(), rate=rate, amount=calculator.valor_ibs_uf(), metadata={'type': 'IbsUf'})
+        result.register_tax('ibs', base=calculator.base_ibs_cbs, rate=rate, amount=calculator.valor_ibs, metadata={'type': 'Ibs'})
 
     def _calculate_cbs(self, context: TaxContext, result: TaxResult) -> None:
         values = context.values
         config = self._tax_details(context, 'cbs')
-        rate = _to_decimal(config.get('aliquota_efetiva_percentual'), self._resolve_rate('cbs', context))
+        rate = _to_decimal(config.get('aliquota_efetiva_percentual'))
+        if rate == ZERO:
+            result.messages.append("CBS: 'aliquota_efetiva_percentual' não configurada em taxes.cbs")
+            return
         deferment = _to_decimal(config.get('percentual_diferimento'))
         calculator = Cbs(
             valor_produto=values.gross_value,
@@ -552,7 +616,17 @@ class TaxEngine:
             aliquota_efetiva_percentual=rate,
             percentual_diferimento=deferment,
         )
-        result.register_tax('cbs', base=calculator.valor_base_ibs_cbs(), rate=rate, amount=calculator.valor_cbs(), metadata={'type': 'Cbs'})
+        result.register_tax('cbs', base=calculator.base_ibs_cbs, rate=rate, amount=calculator.valor_cbs, metadata={'type': 'Cbs'})
+
+    def _format_pydantic_error(self, error: dict) -> str:
+        loc = " → ".join(str(p) for p in error["loc"])
+        if error["type"] == "extra_forbidden":
+            return f"chave inválida em '{loc}': não é um campo reconhecido"
+        if error["type"] == "missing":
+            return f"campo obrigatório ausente: '{loc}'"
+        if error["type"] == "literal_error":
+            return f"valor inválido em '{loc}': {error['msg']}"
+        return f"erro em '{loc}': {error['msg']}"
 
     def _context_from_dict(self, payload: dict[str, Any]) -> TaxContext:
         values_payload = payload.get('values', {})
@@ -574,47 +648,31 @@ class TaxEngine:
             other_expenses=_to_decimal(values_payload.get('other_expenses')),
         )
 
-        rates = {
-            tax_name: _to_decimal(rate)
-            for tax_name, rate in taxes_payload.get('rates', {}).items()
-        }
-        taxes = dict(taxes_payload)
-        taxes['rates'] = rates
-
         return TaxContext(
             values=values,
-            taxes=taxes,
+            taxes=dict(taxes_payload),
         )
-
-    def _resolve_rate(self, tax_name: str, context: TaxContext) -> Decimal:
-        rate = context.get_rate(tax_name)
-        if rate is None:
-            return ZERO
-        return rate
 
     def _tax_details(self, context: TaxContext, tax_name: str) -> dict[str, Any]:
         return context.get_tax_detail(tax_name)
-
-    def _is_enabled(self, context: TaxContext, tax_name: str) -> bool:
-        return tax_name in self._raw_enabled_taxes(context)
 
     def _raw_enabled_taxes(self, context: TaxContext) -> set[str]:
         if not context.taxes:
             return set()
 
+        enabled = {
+            name for name, config in context.taxes.items()
+            if isinstance(config, dict) and name != 'rates'
+        }
+
         enabled_raw = context.taxes.get('enabled', [])
-        enabled = set(enabled_raw if isinstance(enabled_raw, list) else [])
-        rates = context.taxes.get('rates', {})
-        if not enabled:
-            if isinstance(rates, dict):
-                enabled.update(rates)
+        if isinstance(enabled_raw, list) and enabled_raw:
             enabled.update(
-                name
-                for name, config in context.taxes.items()
-                if isinstance(config, dict) and name != 'rates' and config.get('enabled', True)
+                name for name in enabled_raw
+                if name in VALID_TAX_NAMES
             )
 
-        return {tax_name for tax_name in enabled if tax_name in VALID_TAX_NAMES}
+        return enabled
 
     def _mode(self, config: dict[str, Any], *, specific_key: str) -> str:
         raw_mode = str(config.get('mode', '')).strip().lower()
