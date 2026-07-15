@@ -56,6 +56,7 @@ pip-delete-this-directory.txt
 
 # PyPI configuration
 ~/.pypirc
+.commands_pypi
 
 # Unit test / coverage reports
 htmlcov/
